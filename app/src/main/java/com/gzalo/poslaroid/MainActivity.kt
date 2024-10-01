@@ -28,11 +28,18 @@ import com.dantsu.escposprinter.connection.bluetooth.BluetoothConnection
 import com.dantsu.escposprinter.connection.bluetooth.BluetoothPrintersConnections
 import com.dantsu.escposprinter.textparser.PrinterTextParserImg
 import com.gzalo.poslaroid.databinding.ActivityMainBinding
+import java.io.DataInputStream
 import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.net.ServerSocket
+import java.net.Socket
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 
 class MainActivity : AppCompatActivity() {
@@ -44,6 +51,10 @@ class MainActivity : AppCompatActivity() {
     private var cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
     private var printer: EscPosPrinter? = null
     private var connection: BluetoothConnection? = null
+    private var serverSocket: ServerSocket? = null
+    private var serverPort: Int = 7979
+    private var imageServerSocket: ServerSocket? = null
+    private var imageServerPort: Int = 8989
 
     @SuppressLint("MissingPermission")
     @SuppressWarnings("deprecation")
@@ -77,6 +88,58 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(baseContext, "Conectado al dispositivo: " + connection?.device?.name, Toast.LENGTH_SHORT).show()
         }
         printer = EscPosPrinter(connection, 203, 48f, 32)
+
+        startTcpServer()
+        startImageServer()
+    }
+
+    private fun startTcpServer() {
+        GlobalScope.launch(Dispatchers.IO) {
+            try {
+                serverSocket = ServerSocket(0) // 0 means any available port
+                serverPort = serverSocket?.localPort ?: 0
+                Log.i(TAG, "TCP Server started on port $serverPort")
+
+                while (true) {
+                    val clientSocket = serverSocket?.accept()
+                    clientSocket?.let { handleClient(it) }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error starting TCP server: ${e.message}")
+            }
+        }
+    }
+
+    private fun handleClient(clientSocket: Socket) {
+        GlobalScope.launch(Dispatchers.IO) {
+            try {
+                val input = clientSocket.getInputStream().bufferedReader()
+                var line: String?
+                val stringBuilder = StringBuilder()
+
+                while (input.readLine().also { line = it } != null) {
+                    stringBuilder.append(line).append("\n")
+                }
+
+                val receivedData = stringBuilder.toString()
+                printBluetooth(receivedData)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error handling client: ${e.message}")
+            } finally {
+                clientSocket.close()
+            }
+        }
+    }
+
+    private fun printBluetooth(data: String) {
+        try {
+            connection?.connect()
+            printer?.printFormattedText(data)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error printing: ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
     }
 
     private fun mirrorCamera() {
@@ -294,9 +357,69 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private fun startImageServer() {
+        GlobalScope.launch(Dispatchers.IO) {
+            try {
+                imageServerSocket = ServerSocket(8989) // 0 means any available port
+                imageServerPort = imageServerSocket?.localPort ?: 0
+                Log.i(TAG, "Image TCP Server started on port $imageServerPort")
+
+                while (true) {
+                    val clientSocket = imageServerSocket?.accept()
+                    clientSocket?.let { handleImageClient(it) }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error starting image TCP server: ${e.message}")
+            }
+        }
+    }
+
+    private fun handleImageClient(clientSocket: Socket) {
+        GlobalScope.launch(Dispatchers.IO) {
+            try {
+                val inputStream = DataInputStream(clientSocket.getInputStream())
+                val imageSize = inputStream.readInt()
+                val imageBytes = ByteArray(imageSize)
+                inputStream.readFully(imageBytes)
+
+                val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                printBitmapBluetooth(bitmap)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error handling image client: ${e.message}")
+            } finally {
+                clientSocket.close()
+            }
+        }
+    }
+
+    private fun printBitmapBluetooth(bitmap: Bitmap) {
+        try {
+            connection?.connect()
+            
+            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, 384, (384 * bitmap.height / bitmap.width.toFloat()).toInt(), true)
+            val grayscaleBitmap = toGrayscale(resizedBitmap)
+            val ditheredBitmap = floydSteinbergDithering(grayscaleBitmap)
+
+            val text = StringBuilder()
+            for (y in 0 until ditheredBitmap.height step 32) {
+                val segmentHeight = if (y + 32 > ditheredBitmap.height) ditheredBitmap.height - y else 32
+                val segment = Bitmap.createBitmap(ditheredBitmap, 0, y, ditheredBitmap.width, segmentHeight)
+                text.append("<img>" + PrinterTextParserImg.bitmapToHexadecimalString(printer, segment, false) + "</img>\n")
+            }
+
+            printer?.printFormattedText(text.toString() + viewBinding.footerText.text)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error printing bitmap: ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
+        serverSocket?.close()
+        imageServerSocket?.close()
     }
 
     companion object {
